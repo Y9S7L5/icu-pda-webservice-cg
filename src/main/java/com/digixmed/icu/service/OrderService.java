@@ -13,6 +13,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -38,6 +39,9 @@ public class OrderService  {
 
     /** 执行事件状态名：单次用药（isOnce）的组只保留状态为"执行"的最早一条 */
     private static final String EXEC_STATUS = "执行";
+
+    /** 快推记录状态名：非单次用药记录 fast_push_amount 非空时，额外生成一条 status=快推 的执行记录 */
+    private static final String FAST_PUSH_STATUS = "快推";
 
     /** 写入 VI_ICU_HSZ_YYZXJL 时的 _class，需与对端系统实体一致 */
     private static final String ORDER_EXECUTE_CLASS = "com.digixmed.web.internal.data.entity.OrderExecute";
@@ -99,11 +103,14 @@ public class OrderService  {
      * 字段映射：exeId=exeid、orderID=groupid、barCode=barcode、planTime=record_time、
      *          exeTime=record_time、status=status、speed=speed(#前数值)、nurseTrueName/nurseUserName=nurseusername、
      *          supplyCode=supply_code、supplyName=supply_name
+     * 快推记录：非单次用药（持续用药或匹配不到配置）的行 fast_push_amount 非空（非 null 且非空串）时，
+     *          额外生成一条 status=快推、inAmount=fast_push_amount、exeId=源 exeId 尾部数字 +1 的文档，
+     *          其余字段与源记录一致
      * 排除 status 为 摆药/配药 的记录，以及 supplyName 为 检验 的记录（非医嘱执行数据）
      * 幂等：按 exeId upsert，视图里已同步过的老数据只会被更新，不会重复插入
      *
      * @return scan=视图扫描条数, filtered=状态过滤后条数, dedup=去重剔除条数,
-     *         skippedGroups=整组跳过组数, insert=新增条数, update=更新条数
+     *         skippedGroups=整组跳过组数, fastPush=快推生成条数, insert=新增条数, update=更新条数
      */
     private Map<String, Integer> doSynOrderExecute(List<IcuRecordView> records) {
         Map<String, Integer> result = new HashMap<>();
@@ -113,6 +120,7 @@ public class OrderService  {
         result.put("filtered", 0);
         result.put("dedup", 0);
         result.put("skippedGroups", 0);
+        result.put("fastPush", 0);
         if (CollectionUtil.isEmpty(records)) {
             log.info("医嘱执行记录同步：视图无数据");
             return result;
@@ -174,43 +182,23 @@ public class OrderService  {
             log.error("configDrugMethod 加载失败，本次不做单次用药去重：{}", e.getMessage());
             drugMethods = new ArrayList<>();
         }
-        // 步骤3：按 barcode 分组做表单单次用药去重
-        List<IcuRecordView> kept = dedupOnceGroups(postFilter, drugMethods, result);
+        // 步骤3：按 barcode 分组做表单单次用药去重；同时收集非单次用药的保留行（用于生成快推记录）
+        Set<IcuRecordView> nonOnce = Collections.newSetFromMap(new IdentityHashMap<>());
+        List<IcuRecordView> kept = dedupOnceGroups(postFilter, drugMethods, result, nonOnce);
         result.put("dedup", postFilter.size() - kept.size());
         log.info("医嘱执行记录同步：去重后保留 {} 条（剔除 {} 条）", kept.size(), result.get("dedup"));
         if (CollectionUtil.isEmpty(kept)) {
             log.info("医嘱执行记录同步：去重后无数据，状态过滤后 {} 条", postFilter.size());
             return result;
         }
-        // 步骤4：构建文档（原字段映射不变，追加供药码两列）
-        List<Document> docList = new ArrayList<>();
-        for (IcuRecordView record : kept) {
-            String status = record.getStatus() == null ? null : record.getStatus().trim();
-            Document doc = new Document();
-            doc.put("_class", ORDER_EXECUTE_CLASS);
-            doc.put("exeId", record.getExeid());
-            // orderID 对应视图的 groupid
-            doc.put("orderID", record.getGroupId());
-            doc.put("barCode", record.getBarcode());
-            // 计划时间取视图的 record_time（不再用 plan_time）
-            doc.put("planTime", record.getRecordTime());
-            doc.put("exeTime", record.getRecordTime());
-            doc.put("status", status);
-            doc.put("speed", parseSpeed(record.getSpeed()));
-            doc.put("nurseTrueName", record.getNurseUsername());
-            // 新增字段：护士用户名
-            doc.put("nurseUserName", record.getNurseUsername());
-            // 新增字段：给药途径编码/名称（视图 supply_code / supply_name）
-            doc.put("supplyCode", record.getSupplyCode());
-            doc.put("supplyName", record.getSupplyName());
-            docList.add(doc);
-        }
+        // 步骤4：构建文档（原字段映射不变；非单次用药 fast_push_amount 非空的额外生成快推记录）
+        List<Document> docList = buildExecuteDocs(kept, nonOnce, result);
         // 步骤5：按 exeId upsert（不变）
         Map<String, Integer> count = this.mongoDao.updateOrSaveOrderExecDocs(docList);
         result.putAll(count);
-        log.info("医嘱执行记录同步完成：视图 {} 条，状态过滤后 {} 条，去重剔除 {} 条（整组跳过 {} 组），新增 {} 条，更新 {} 条",
+        log.info("医嘱执行记录同步完成：视图 {} 条，状态过滤后 {} 条，去重剔除 {} 条（整组跳过 {} 组），快推 {} 条，新增 {} 条，更新 {} 条",
                 records.size(), postFilter.size(), result.get("dedup"), result.get("skippedGroups"),
-                count.get("insert"), count.get("update"));
+                result.get("fastPush"), count.get("insert"), count.get("update"));
         return result;
     }
 
@@ -228,6 +216,19 @@ public class OrderService  {
     List<IcuRecordView> dedupOnceGroups(List<IcuRecordView> postFilter,
                                         List<Document> drugMethods,
                                         Map<String, Integer> result) {
+        return dedupOnceGroups(postFilter, drugMethods, result, null);
+    }
+
+    /**
+     * 按 barcode 分组做表单单次用药（isOnce）去重，见 {@link #dedupOnceGroups(List, List, Map)}：
+     *
+     * @param nonOnce 出参（可为 null）：判定为非单次用药（持续用药或匹配不到配置）且被保留的记录，
+     *                供后续按 fast_push_amount 生成快推记录使用（按引用识别，与 kept 中的行同实例）
+     */
+    List<IcuRecordView> dedupOnceGroups(List<IcuRecordView> postFilter,
+                                        List<Document> drugMethods,
+                                        Map<String, Integer> result,
+                                        Set<IcuRecordView> nonOnce) {
         // 被剔除的行集合（按引用识别），最后一遍按原顺序收集保留行
         Set<IcuRecordView> dropped = Collections.newSetFromMap(new IdentityHashMap<>());
         Map<String, List<IcuRecordView>> groups = new LinkedHashMap<>();
@@ -235,8 +236,11 @@ public class OrderService  {
         for (IcuRecordView record : postFilter) {
             String barcode = record.getBarcode() == null ? null : record.getBarcode().trim();
             if (barcode == null || barcode.isEmpty()) {
-                // 空 barcode 不分组，按原样逐条同步
+                // 空 barcode 不分组，按原样逐条同步；是否单次用药按自身供药码判断
                 noBarcode++;
+                if (nonOnce != null && !isOnceRecord(record, drugMethods)) {
+                    nonOnce.add(record);
+                }
                 continue;
             }
             groups.computeIfAbsent(barcode, k -> new ArrayList<>()).add(record);
@@ -258,7 +262,10 @@ public class OrderService  {
             }
             Document config = findDrugMethod(supplyCode, drugMethods);
             if (config == null || !Boolean.TRUE.equals(config.getBoolean("isOnce"))) {
-                // 非单次用药或匹配不到配置：整组原样保留
+                // 非单次用药或匹配不到配置：整组原样保留，并记录为非单次用药（生成快推记录的候选）
+                if (nonOnce != null) {
+                    nonOnce.addAll(group);
+                }
                 continue;
             }
             // 单次用药：只保留 status=执行 的最早一条
@@ -313,6 +320,126 @@ public class OrderService  {
             }
         }
         return null;
+    }
+
+    /**
+     * 单条记录是否单次用药：按自身的 supply_code 匹配 configDrugMethod，
+     * 匹配不到配置或配置 isOnce != true 均视为非单次用药（与分组判定规则一致）
+     */
+    static boolean isOnceRecord(IcuRecordView record, List<Document> drugMethods) {
+        Document config = findDrugMethod(record.getSupplyCode(), drugMethods);
+        return config != null && Boolean.TRUE.equals(config.getBoolean("isOnce"));
+    }
+
+    /**
+     * 构建待写入文档列表：
+     * - 每条保留记录生成一条常规执行文档（字段映射与原逻辑一致）
+     * - 非单次用药（持续用药或匹配不到配置）的记录，fast_push_amount 非空（null 或空串视为无）时
+     *   额外生成一条快推文档：exeId = 源 exeId 尾部数字整体 +1，status=快推，inAmount=fast_push_amount，
+     *   barCode/exeTime/nurseTrueName/nurseUserName/orderID/planTime/speed/supplyCode/supplyName 与源记录一致
+     * - exeId 无尾部数字、或 +1 后与本批已有 exeId（源记录/已生成的快推记录）冲突时跳过该条并告警，
+     *   避免 upsert 时覆盖真实事件文档
+     *
+     * @param nonOnce 非单次用药的保留记录集合（按引用识别，可为 null）
+     * @param result  出参：累加 fastPush（实际生成的快推条数）
+     */
+    List<Document> buildExecuteDocs(List<IcuRecordView> kept,
+                                    Set<IcuRecordView> nonOnce,
+                                    Map<String, Integer> result) {
+        List<Document> docList = new ArrayList<>();
+        // 本批已占用的 exeId（源记录 + 已生成的快推记录），用于冲突检测
+        Set<String> usedExeIds = new HashSet<>();
+        for (IcuRecordView record : kept) {
+            String exeId = record.getExeid() == null ? null : record.getExeid().trim();
+            if (exeId != null && !exeId.isEmpty()) {
+                usedExeIds.add(exeId);
+            }
+            docList.add(buildExecuteDoc(record));
+        }
+        int fastPushCount = 0;
+        for (IcuRecordView record : kept) {
+            if (nonOnce == null || !nonOnce.contains(record)) {
+                continue;
+            }
+            String fastPushAmount = record.getFastPushAmount() == null ? null : record.getFastPushAmount().trim();
+            if (fastPushAmount == null || fastPushAmount.isEmpty()) {
+                continue;
+            }
+            String fastExeId = fastPushExeId(record.getExeid());
+            if (fastExeId == null) {
+                log.warn("快推记录生成跳过：exeId 无末尾数字无法 +1，exeId={}, fastPushAmount={}",
+                        record.getExeid(), fastPushAmount);
+                continue;
+            }
+            if (!usedExeIds.add(fastExeId)) {
+                log.warn("快推记录生成跳过：exeId+1 与本批已有 exeId 冲突，源 exeId={}, 快推 exeId={}, fastPushAmount={}",
+                        record.getExeid(), fastExeId, fastPushAmount);
+                continue;
+            }
+            Document fastDoc = buildExecuteDoc(record);
+            fastDoc.put("exeId", fastExeId);
+            fastDoc.put("status", FAST_PUSH_STATUS);
+            fastDoc.put("inAmount", fastPushAmount);
+            docList.add(fastDoc);
+            fastPushCount++;
+            log.info("快推记录生成：源 exeId={}, 快推 exeId={}, inAmount={}",
+                    record.getExeid(), fastExeId, fastPushAmount);
+        }
+        if (fastPushCount > 0) {
+            result.merge("fastPush", fastPushCount, Integer::sum);
+        }
+        return docList;
+    }
+
+    /**
+     * 构建单条执行记录文档（字段映射：exeId=exeid、orderID=groupid、barCode=barcode、
+     * planTime/exeTime=record_time、status、speed(#前数值)、nurseTrueName/nurseUserName=nurseusername、
+     * supplyCode/supplyName）
+     */
+    private Document buildExecuteDoc(IcuRecordView record) {
+        Document doc = new Document();
+        doc.put("_class", ORDER_EXECUTE_CLASS);
+        doc.put("exeId", record.getExeid());
+        // orderID 对应视图的 groupid
+        doc.put("orderID", record.getGroupId());
+        doc.put("barCode", record.getBarcode());
+        // 计划时间取视图的 record_time（不再用 plan_time）
+        doc.put("planTime", record.getRecordTime());
+        doc.put("exeTime", record.getRecordTime());
+        doc.put("status", record.getStatus() == null ? null : record.getStatus().trim());
+        doc.put("speed", parseSpeed(record.getSpeed()));
+        doc.put("nurseTrueName", record.getNurseUsername());
+        // 新增字段：护士用户名
+        doc.put("nurseUserName", record.getNurseUsername());
+        // 新增字段：给药途径编码/名称（视图 supply_code / supply_name）
+        doc.put("supplyCode", record.getSupplyCode());
+        doc.put("supplyName", record.getSupplyName());
+        return doc;
+    }
+
+    /**
+     * 快推记录的 exeId：取源 exeId 末尾连续数字段整体 +1（如 …142926 → …142927）。
+     * 进位变长时直接使用新长度；去前导零变短时左侧补零保持原数字段长度。
+     * exeId 为空或无末尾数字时返回 null（调用方跳过生成并告警）
+     */
+    static String fastPushExeId(String exeId) {
+        if (exeId == null || exeId.trim().isEmpty()) {
+            return null;
+        }
+        String trimmed = exeId.trim();
+        int start = trimmed.length();
+        while (start > 0 && Character.isDigit(trimmed.charAt(start - 1))) {
+            start--;
+        }
+        if (start == trimmed.length()) {
+            return null;
+        }
+        String digits = trimmed.substring(start);
+        String incremented = new BigInteger(digits).add(BigInteger.ONE).toString();
+        while (incremented.length() < digits.length()) {
+            incremented = "0" + incremented;
+        }
+        return trimmed.substring(0, start) + incremented;
     }
 
     /**

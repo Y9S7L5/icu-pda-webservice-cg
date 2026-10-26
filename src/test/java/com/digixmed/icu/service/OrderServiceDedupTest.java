@@ -10,10 +10,13 @@ import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -204,5 +207,107 @@ class OrderServiceDedupTest {
         List<IcuRecordView> kept = orderService.dedupOnceGroups(input, configs, result);
         assertEquals(Arrays.asList("o2", "x1", "x2"), ids(kept));
         assertEquals(0, result.getOrDefault("skippedGroups", 0));
+    }
+
+    /* ==== 非单次用药标记与快推记录 ==== */
+
+    @Test
+    void dedupOnceGroups_collectsNonOnceKeptRowsOnly() {
+        List<Document> configs = Arrays.asList(config("1", false), config("104", true));
+        List<IcuRecordView> input = Arrays.asList(
+                row("o1", "BC1", "执行", "104", t(10)),   // isOnce 组：不进 nonOnce
+                row("n1", "BC2", "执行", "1", t(20)),      // isOnce=false 组：整组进 nonOnce
+                row("n2", "BC2", "结束", "1", t(30)),
+                row("b1", null, "执行", "1", t(40)));      // 空 barcode：按自身供药码判定，进 nonOnce
+        Set<IcuRecordView> nonOnce = Collections.newSetFromMap(new IdentityHashMap<>());
+        List<IcuRecordView> kept = orderService.dedupOnceGroups(input, configs, new HashMap<>(), nonOnce);
+        assertEquals(Arrays.asList("o1", "n1", "n2", "b1"), ids(kept));
+        assertEquals(3, nonOnce.size());
+        assertFalse(nonOnce.contains(input.get(0)));
+    }
+
+    @Test
+    void fastPushExeId_incrementsTrailingDigits() {
+        assertEquals("20261023_20261015002413_1_120261023142928",
+                OrderService.fastPushExeId("20261023_20261015002413_1_120261023142927"));
+        assertEquals("e2", OrderService.fastPushExeId("e1"));
+        assertEquals("e10", OrderService.fastPushExeId("e9"));
+        // 进位去前导零时补零保持原数字段长度
+        assertEquals("abc008", OrderService.fastPushExeId("abc007"));
+    }
+
+    @Test
+    void fastPushExeId_nullWhenNoTrailingDigits() {
+        assertNull(OrderService.fastPushExeId("abcdef"));
+        assertNull(OrderService.fastPushExeId(null));
+        assertNull(OrderService.fastPushExeId("  "));
+    }
+
+    @Test
+    void buildExecuteDocs_nonOnceWithAmountGeneratesFastPushDoc() {
+        IcuRecordView r = row("e1", "BC1", "执行", "124", t(10));
+        r.setFastPushAmount("10");
+        r.setNurseUsername("李艳");
+        r.setSupplyName("微量泵注入");
+        Map<String, Integer> result = new HashMap<>();
+        List<Document> docs = orderService.buildExecuteDocs(
+                Collections.singletonList(r), Collections.singleton(r), result);
+
+        assertEquals(2, docs.size());
+        // 常规文档：exeId/status 不变，无 inAmount
+        Document base = docs.get(0);
+        assertEquals("e1", base.getString("exeId"));
+        assertEquals("执行", base.getString("status"));
+        assertFalse(base.containsKey("inAmount"));
+        // 快推文档：exeId+1、status=快推、inAmount=fast_push_amount，其余字段与源记录一致
+        Document fast = docs.get(1);
+        assertEquals("e2", fast.getString("exeId"));
+        assertEquals("快推", fast.getString("status"));
+        assertEquals("10", fast.getString("inAmount"));
+        assertEquals("BC1", fast.getString("barCode"));
+        assertEquals("g-e1", fast.getString("orderID"));
+        assertEquals("李艳", fast.getString("nurseTrueName"));
+        assertEquals("李艳", fast.getString("nurseUserName"));
+        assertEquals("124", fast.getString("supplyCode"));
+        assertEquals("微量泵注入", fast.getString("supplyName"));
+        assertEquals(t(10), fast.getDate("planTime"));
+        assertEquals(t(10), fast.getDate("exeTime"));
+        assertEquals(1, result.getOrDefault("fastPush", 0));
+    }
+
+    @Test
+    void buildExecuteDocs_skipsWhenOnceOrAmountEmpty() {
+        IcuRecordView once = row("o1", "BC1", "执行", "104", t(10));
+        once.setFastPushAmount("10"); // 单次用药：不生成快推
+        IcuRecordView blank = row("n1", "BC2", "执行", "1", t(20));
+        blank.setFastPushAmount("  "); // 空字符串：不生成快推
+        IcuRecordView empty = row("n2", "BC3", "执行", "1", t(30));
+        empty.setFastPushAmount(null); // null：不生成快推
+        Map<String, Integer> result = new HashMap<>();
+        Set<IcuRecordView> nonOnce = Collections.newSetFromMap(new IdentityHashMap<>());
+        nonOnce.add(blank);
+        nonOnce.add(empty);
+        // once 不在 nonOnce 中；blank/empty 在但金额为空
+        List<Document> docs = orderService.buildExecuteDocs(
+                Arrays.asList(once, blank, empty), nonOnce, result);
+        assertEquals(3, docs.size());
+        assertEquals(0, result.getOrDefault("fastPush", 0));
+    }
+
+    @Test
+    void buildExecuteDocs_skipsFastPushWhenExeIdCollidesInBatch() {
+        IcuRecordView r1 = row("e1", "BC1", "执行", "124", t(10));
+        r1.setFastPushAmount("10"); // e1+1=e2，与批内另一条源记录冲突
+        IcuRecordView r2 = row("e2", "BC2", "执行", "124", t(20));
+        Map<String, Integer> result = new HashMap<>();
+        Set<IcuRecordView> nonOnce = Collections.newSetFromMap(new IdentityHashMap<>());
+        nonOnce.add(r1);
+        nonOnce.add(r2);
+        List<Document> docs = orderService.buildExecuteDocs(Arrays.asList(r1, r2), nonOnce, result);
+        // 冲突时只保留两条常规文档，不生成快推，避免覆盖真实事件
+        assertEquals(2, docs.size());
+        assertEquals("e1", docs.get(0).getString("exeId"));
+        assertEquals("e2", docs.get(1).getString("exeId"));
+        assertEquals(0, result.getOrDefault("fastPush", 0));
     }
 }

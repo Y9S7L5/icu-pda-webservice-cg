@@ -58,5 +58,9 @@ public class IcuRecordView {
     @Column(name = "supply_name")
     private String supplyName;
 
+    /** HIS 视图新增列：快推量。非单次用药记录该值非空时，额外生成一条 status=快推 的执行记录 */
+    @Column(name = "fast_push_amount")
+    private String fastPushAmount;
+
     // Getters and Setters ...
 }

@@ -54,7 +54,7 @@ public class ICUHanderController {
     private String formatSynResult(Map<String, Integer> result) {
         return "同步完成：扫描 " + result.get("scan") + " 条，状态过滤后 " + result.get("filtered")
                 + " 条，去重剔除 " + result.get("dedup") + " 条（整组跳过 " + result.get("skippedGroups")
-                + " 组），新增 " + result.get("insert") + " 条，更新 " + result.get("update")
+                + " 组），快推 " + result.get("fastPush") + " 条，新增 " + result.get("insert") + " 条，更新 " + result.get("update")
                 + " 条（按 exeId upsert：没有新增，有则修改）";
     }
 
